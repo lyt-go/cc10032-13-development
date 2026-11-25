@@ -15,7 +15,7 @@ import time
 from typing import Any
 
 from app.services.base import BaseModuleService
-from app.store import store
+from app.store import norm_num, range_gaps, readable_span, store
 
 
 class MergePlanService(BaseModuleService):
@@ -115,3 +115,99 @@ class MergePlanService(BaseModuleService):
         base = super().domain_snapshot()
         base["active_plans"] = sum(1 for r in store.rows(self.MODULE) if r.get("status") == "运行中")
         return base
+
+    # ---- 合并覆盖清单：消费 batch_slice 批量登记的区间覆盖 ----
+    def coverage_manifest(
+        self,
+        source_table: str,
+        key_column: str,
+        sel_start: float | None = None,
+        sel_end: float | None = None,
+    ) -> dict[str, Any]:
+        """合并覆盖清单视图：已登记区间、连续段、选定范围缺口、合并可读范围与采用日志。"""
+        view = store.coverage_view(source_table, key_column)
+        manifest: dict[str, Any] = {
+            "ok": True,
+            "源表名称": source_table,
+            "分片键列": key_column,
+            "已登记区间": [
+                {
+                    "编号": c["编号"],
+                    "批次编号": c["批次编号"],
+                    "起始值": c["起始值"],
+                    "结束值": c["结束值"],
+                    "来源": c.get("来源"),
+                    "entry_id": c.get("entry_id"),
+                }
+                for c in view["intervals"]
+            ],
+            "连续覆盖": [
+                {"起始值": norm_num(s), "结束值": norm_num(e)} for s, e in view["segments"]
+            ],
+            "采用日志": view["adoptions"],
+        }
+        if sel_start is not None and sel_end is not None:
+            manifest.update(self._coverage_check(view["segments"], sel_start, sel_end))
+        return manifest
+
+    def adopt_coverage(
+        self, plan_id: int, sel_start: float, sel_end: float
+    ) -> dict[str, Any]:
+        """合并计划采用覆盖清单：只在选定范围没有未解释缺口时才采用。
+
+        采用结果（含失败原因）写入覆盖清单的采用日志，供事后核对。
+        """
+        plan = store.find(self.MODULE, plan_id)
+        if plan is None:
+            return {"ok": False, "reason": f"计划 {plan_id} 不存在"}
+        source_table = str(plan.get("批式来源", "") or "").strip()
+        key_column = str(plan.get("合并键列", "") or "").strip()
+        if not source_table or not key_column:
+            return {"ok": False, "reason": "计划缺少批式来源或合并键列，无法定位覆盖清单"}
+        if float(sel_start) >= float(sel_end):
+            return {"ok": False, "reason": f"选择范围无效: 起始值 {norm_num(sel_start)} >= 结束值 {norm_num(sel_end)}"}
+
+        view = store.coverage_view(source_table, key_column)
+        check = self._coverage_check(view["segments"], sel_start, sel_end)
+        record = {
+            "计划编号": plan.get("计划编号"),
+            "ok": check["可整体采用"],
+            "reason": "" if check["可整体采用"] else self._gap_reason(check["缺口"]),
+            **check,
+        }
+        store.record_coverage_adoption(source_table, key_column, record)
+        result = {
+            "ok": check["可整体采用"],
+            "计划编号": plan.get("计划编号"),
+            "源表名称": source_table,
+            "分片键列": key_column,
+            **check,
+        }
+        if not check["可整体采用"]:
+            result["reason"] = record["reason"]
+        return result
+
+    @staticmethod
+    def _coverage_check(
+        segments: list[tuple[float, float]], sel_start: float, sel_end: float
+    ) -> dict[str, Any]:
+        """核对选定范围：缺口、合并开始可读的范围、是否可整体采用。"""
+        start = float(sel_start)
+        end = float(sel_end)
+        gaps = range_gaps(segments, start, end)
+        readable = readable_span(segments, start, end)
+        return {
+            "选择范围": {"起始值": norm_num(start), "结束值": norm_num(end)},
+            "缺口": [{"起始值": norm_num(s), "结束值": norm_num(e)} for s, e in gaps],
+            "可读范围": (
+                {"起始值": norm_num(readable[0]), "结束值": norm_num(readable[1])}
+                if readable is not None
+                else None
+            ),
+            "可整体采用": not gaps,
+        }
+
+    @staticmethod
+    def _gap_reason(gaps: list[dict[str, Any]]) -> str:
+        parts = "、".join(f"[{gap['起始值']},{gap['结束值']})" for gap in gaps)
+        return f"选定范围存在未解释缺口: {parts}"

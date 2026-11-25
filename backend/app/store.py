@@ -5,10 +5,64 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 from typing import Any
 
 from app.seed import SEED_ROWS
+
+
+def norm_num(value: Any) -> int | float:
+    """把分片边界规范成 int/float：整数值显示为 int，避免 10.0 这种噪音。"""
+    num = float(value)
+    return int(num) if num.is_integer() else num
+
+
+def merge_segments(ranges: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """把 half-open 区间列表合并成连续段：重叠或首尾相接（相邻）都拼成一段。"""
+    segments: list[list[float]] = []
+    for start, end in sorted((float(s), float(e)) for s, e in ranges):
+        if segments and start <= segments[-1][1]:
+            segments[-1][1] = max(segments[-1][1], end)
+        else:
+            segments.append([start, end])
+    return [(s, e) for s, e in segments]
+
+
+def range_gaps(
+    segments: list[tuple[float, float]], start: float, end: float
+) -> list[tuple[float, float]]:
+    """计算连续段在选定范围 [start, end) 内留下的缺口。"""
+    gaps: list[tuple[float, float]] = []
+    cursor = float(start)
+    for seg_start, seg_end in segments:
+        if seg_end <= cursor or seg_start >= end:
+            continue
+        clipped_start = max(seg_start, cursor)
+        if clipped_start > cursor:
+            gaps.append((cursor, clipped_start))
+        cursor = max(cursor, min(seg_end, float(end)))
+    if cursor < end:
+        gaps.append((cursor, float(end)))
+    return gaps
+
+
+def readable_span(
+    segments: list[tuple[float, float]], start: float, end: float
+) -> tuple[float, float] | None:
+    """合并开始可读的范围：从 start 起连续被覆盖、且不超出 [start, end) 的最长区间。"""
+    cursor = float(start)
+    for seg_start, seg_end in segments:
+        if seg_end <= cursor:
+            continue
+        if seg_start > cursor:
+            break
+        cursor = max(cursor, min(seg_end, float(end)))
+        if cursor >= end:
+            break
+    if cursor <= float(start):
+        return None
+    return (float(start), cursor)
 
 
 class DataPipeline:
@@ -133,6 +187,12 @@ class Store:
         self._lineage_graph: dict[str, list[dict[str, Any]]] = {}
         # 归档清单（cold_archive → retention 共享）
         self._archive_manifest: list[dict[str, Any]] = []
+        # 合并覆盖清单（batch_slice 批量登记 → merge_plan 采用 共享）
+        # key: f"{源表名称}::{分片键列}"，value 含已确认区间与合并采用日志
+        self._merge_coverage: dict[str, dict[str, Any]] = {}
+        self._coverage_seq = 0
+        # 批量登记的互斥锁：并发提交时保证“检查冲突 + 确认区间”原子完成
+        self.coverage_lock = threading.RLock()
 
     # ---------- 基础 CRUD ----------
     def module_names(self) -> list[str]:
@@ -239,6 +299,162 @@ class Store:
 
     def archive_manifest_for_table(self, table_name: str) -> list[dict[str, Any]]:
         return [r for r in self._archive_manifest if r.get("源表名称") == table_name]
+
+    # ---------- 合并覆盖清单 ----------
+    @staticmethod
+    def coverage_scope_key(source_table: str, key_column: str) -> str:
+        """覆盖清单按（源表名称, 分片键列）确定范围。"""
+        return f"{source_table}::{key_column}"
+
+    def coverage_scope(
+        self, source_table: str, key_column: str, *, create: bool = False
+    ) -> dict[str, Any] | None:
+        key = self.coverage_scope_key(source_table, key_column)
+        scope = self._merge_coverage.get(key)
+        if scope is None and create:
+            scope = {
+                "源表名称": source_table,
+                "分片键列": key_column,
+                "intervals": [],
+                "adoptions": [],
+            }
+            self._merge_coverage[key] = scope
+        return scope
+
+    def commit_coverage_intervals(
+        self,
+        source_table: str,
+        key_column: str,
+        source_tag: str,
+        intervals: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """把一批分片区间原子提交进合并覆盖清单，逐条返回编号或冲突范围。
+
+        - 重叠判定按 half-open 区间：相邻（end == start）允许拼接，不算冲突
+        - 同编号同范围重投：返回原登记结果（原编号、原条目），不重复登记
+        - 同编号不同范围：按冲突拒绝
+        调用方需持有 coverage_lock（方法内部可重入），保证并发批量提交时
+        “检查冲突 + 确认区间”不会被另一批插队。
+        """
+        results: list[dict[str, Any]] = []
+        with self.coverage_lock:
+            scope = self.coverage_scope(source_table, key_column, create=True)
+            assert scope is not None
+            committed: list[dict[str, Any]] = scope["intervals"]
+            for interval in intervals:
+                batch_no = interval["批次编号"]
+                start = float(interval["起始值"])
+                end = float(interval["结束值"])
+
+                # 幂等重投：同编号同范围返回原结果；同编号不同范围按冲突拒绝
+                same_no = next((c for c in committed if c["批次编号"] == batch_no), None)
+                if same_no is not None:
+                    if float(same_no["起始值"]) == start and float(same_no["结束值"]) == end:
+                        results.append({
+                            "ok": True,
+                            "重投": True,
+                            "批次编号": batch_no,
+                            "起始值": norm_num(start),
+                            "结束值": norm_num(end),
+                            "编号": same_no["编号"],
+                            "entry_id": same_no.get("entry_id"),
+                        })
+                    else:
+                        results.append({
+                            "ok": False,
+                            "批次编号": batch_no,
+                            "起始值": norm_num(start),
+                            "结束值": norm_num(end),
+                            "reason": (
+                                f"批次编号 {batch_no} 已登记范围 "
+                                f"[{norm_num(same_no['起始值'])},{norm_num(same_no['结束值'])})，"
+                                f"与本次 [{norm_num(start)},{norm_num(end)}) 不一致"
+                            ),
+                            "冲突范围": {
+                                "起始值": norm_num(same_no["起始值"]),
+                                "结束值": norm_num(same_no["结束值"]),
+                                "冲突批次": same_no["批次编号"],
+                                "冲突编号": same_no["编号"],
+                            },
+                        })
+                    continue
+
+                # 重叠检测：half-open 区间，相邻边界相等不算重叠
+                overlap = next(
+                    (c for c in committed
+                     if start < float(c["结束值"]) and float(c["起始值"]) < end),
+                    None,
+                )
+                if overlap is not None:
+                    results.append({
+                        "ok": False,
+                        "批次编号": batch_no,
+                        "起始值": norm_num(start),
+                        "结束值": norm_num(end),
+                        "reason": (
+                            f"与已登记区间 [{norm_num(overlap['起始值'])},"
+                            f"{norm_num(overlap['结束值'])}) 重叠"
+                        ),
+                        "冲突范围": {
+                            "起始值": norm_num(max(start, float(overlap["起始值"]))),
+                            "结束值": norm_num(min(end, float(overlap["结束值"]))),
+                            "冲突批次": overlap["批次编号"],
+                            "冲突编号": overlap["编号"],
+                        },
+                    })
+                    continue
+
+                self._coverage_seq += 1
+                reg_no = f"COV-{self._coverage_seq:04d}"
+                record = {
+                    "编号": reg_no,
+                    "批次编号": batch_no,
+                    "起始值": norm_num(start),
+                    "结束值": norm_num(end),
+                    "来源": source_tag,
+                    "entry_id": None,
+                    "ts": time.time(),
+                }
+                committed.append(record)
+                results.append({
+                    "ok": True,
+                    "重投": False,
+                    "批次编号": batch_no,
+                    "起始值": norm_num(start),
+                    "结束值": norm_num(end),
+                    "编号": reg_no,
+                    "entry_id": None,
+                })
+        return results
+
+    def find_coverage_record(
+        self, source_table: str, key_column: str, reg_no: str
+    ) -> dict[str, Any] | None:
+        scope = self.coverage_scope(source_table, key_column)
+        if scope is None:
+            return None
+        return next((c for c in scope["intervals"] if c["编号"] == reg_no), None)
+
+    def coverage_view(self, source_table: str, key_column: str) -> dict[str, Any]:
+        """覆盖清单视图：已登记区间（按起始值排序）与拼接后的连续段。"""
+        scope = self.coverage_scope(source_table, key_column)
+        intervals = [] if scope is None else sorted(
+            scope["intervals"], key=lambda c: (float(c["起始值"]), float(c["结束值"]))
+        )
+        segments = merge_segments([(c["起始值"], c["结束值"]) for c in intervals])
+        return {
+            "intervals": intervals,
+            "segments": segments,
+            "adoptions": [] if scope is None else list(scope["adoptions"]),
+        }
+
+    def record_coverage_adoption(
+        self, source_table: str, key_column: str, record: dict[str, Any]
+    ) -> None:
+        """记录一次合并采用结果（含失败原因），供事后核对。"""
+        scope = self.coverage_scope(source_table, key_column, create=True)
+        assert scope is not None
+        scope["adoptions"].append({**record, "ts": time.time()})
 
 
 store = Store()

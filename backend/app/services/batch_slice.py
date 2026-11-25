@@ -17,7 +17,7 @@ import time
 from typing import Any
 
 from app.services.base import BaseModuleService
-from app.store import store
+from app.store import norm_num, store
 
 
 class BatchSliceService(BaseModuleService):
@@ -128,6 +128,123 @@ class BatchSliceService(BaseModuleService):
             "topics": source_topics,
             "mapped_batches": [r.get("批次编号") for r in store.rows(self.MODULE) if r.get("status") == "待执行"],
         }
+
+    # ---- 批量登记：基于已启用流式源清单，一次提交多段区间 ----
+    def batch_register(
+        self,
+        source_id: int,
+        source_table: str,
+        key_column: str,
+        intervals: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """基于已启用流式源清单的分片批量登记。
+
+        - 来源必须在已启用清单中；停用来源不能再登记新切割
+        - 以（源表名称, 分片键列）确定范围，多段区间一次提交
+        - 逐条给出登记编号或冲突范围；相邻区间允许拼接
+        - 同编号同范围重投返回原结果；同编号不同范围按冲突拒绝
+        - 并发提交由 store.coverage_lock 串行化，只确认无重叠的结果
+        - 确认结果同步到合并覆盖清单，供 merge_plan 采用
+        """
+        source = store.find("stream_source", int(source_id))
+        if source is None:
+            return {"ok": False, "reason": f"流式源 {source_id} 不存在"}
+        status = source.get("status")
+        if status == "已停用":
+            return {"ok": False, "reason": f"来源 {source.get('源标识')} 已停用，不能再登记新切割"}
+        if status != "已启用":
+            return {
+                "ok": False,
+                "reason": f"来源 {source.get('源标识')} 未启用（当前状态 {status}），不在已启用清单中",
+            }
+        source_table = str(source_table or "").strip()
+        key_column = str(key_column or "").strip()
+        if not source_table or not key_column:
+            return {"ok": False, "reason": "源表名称和分片键列不能为空"}
+        if not intervals:
+            return {"ok": False, "reason": "至少提交一段区间"}
+
+        # 预校验：逐段规范化，非法段直接给出原因，合法段进入原子提交
+        slots: list[dict[str, Any] | None] = [None] * len(intervals)
+        prepared: list[tuple[int, dict[str, Any]]] = []
+        for idx, raw in enumerate(intervals):
+            batch_no = str(raw.get("批次编号", "") or "").strip()
+            label = batch_no or f"第{idx + 1}段"
+            if not batch_no:
+                slots[idx] = {"ok": False, "批次编号": label, "reason": "批次编号不能为空"}
+                continue
+            try:
+                start = float(raw.get("分片起始值"))
+                end = float(raw.get("分片结束值"))
+            except (TypeError, ValueError):
+                slots[idx] = {"ok": False, "批次编号": batch_no, "reason": "分片起始/结束值不是数值"}
+                continue
+            if start >= end:
+                slots[idx] = {
+                    "ok": False,
+                    "批次编号": batch_no,
+                    "起始值": norm_num(start),
+                    "结束值": norm_num(end),
+                    "reason": f"起始值 {norm_num(start)} 必须小于结束值 {norm_num(end)}",
+                }
+                continue
+            prepared.append((idx, {"批次编号": batch_no, "起始值": start, "结束值": end}))
+
+        # 原子提交：并发批量登记在此串行，只确认无重叠的区间
+        with store.coverage_lock:
+            committed = store.commit_coverage_intervals(
+                source_table,
+                key_column,
+                str(source.get("源标识")),
+                [item for _, item in prepared],
+            )
+            for (idx, _), result in zip(prepared, committed):
+                if result["ok"] and not result.get("重投"):
+                    # 同步登记一条分片批次条目，并把条目 id 回写进覆盖清单
+                    entry = self._create_slice_entry(source_table, key_column, result)
+                    result["entry_id"] = entry["id"]
+                    record = store.find_coverage_record(source_table, key_column, result["编号"])
+                    if record is not None:
+                        record["entry_id"] = entry["id"]
+                slots[idx] = result
+
+        results = [slot for slot in slots if slot is not None]
+        confirmed = [r for r in results if r["ok"]]
+        view = store.coverage_view(source_table, key_column)
+        return {
+            "ok": True,
+            "来源": source.get("源标识"),
+            "源表名称": source_table,
+            "分片键列": key_column,
+            "确认数": len(confirmed),
+            "冲突数": len(results) - len(confirmed),
+            "结果": results,
+            "连续覆盖": [
+                {"起始值": norm_num(s), "结束值": norm_num(e)} for s, e in view["segments"]
+            ],
+        }
+
+    def _create_slice_entry(
+        self, source_table: str, key_column: str, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """为确认的分片区间登记一条批次分片条目。"""
+        rows = store.rows(self.MODULE)
+        entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
+        entry.update({
+            "批次编号": result["批次编号"],
+            "源表名称": source_table,
+            "分片键列": key_column,
+            "分片起始值": str(norm_num(result["起始值"])),
+            "分片结束值": str(norm_num(result["结束值"])),
+            "预计行数": str(int(float(result["结束值"]) - float(result["起始值"]))),
+            "并行线程": "4",
+            "完成时间": "",
+        })
+        entry["status"] = self.STATUS_ORDER[0]
+        entry["pending"] = True
+        entry["abnormal"] = False
+        rows.append(entry)
+        return entry
 
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
